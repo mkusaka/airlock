@@ -122,14 +122,14 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("failed to bind {}", args.listen))?;
     eprintln!("airlock listening on http://{}/mcp", listener.local_addr()?);
     axum::serve(listener, router)
-        .with_graceful_shutdown(async {
+        .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
+            // Killing children ends their SSE streams, letting connections drain.
+            for session in app.sessions.lock().unwrap().drain().map(|(_, s)| s) {
+                session.kill();
+            }
         })
         .await?;
-
-    for session in app.sessions.lock().unwrap().drain().map(|(_, s)| s) {
-        session.kill();
-    }
     Ok(())
 }
 
@@ -189,7 +189,7 @@ async fn handle_post(State(app): State<Arc<App>>, headers: HeaderMap, body: Byte
                 }
             }
         }
-        // Includes sessionless `server/discover`: clients fall back to `initialize`.
+        // Includes sessionless `server/discover`; clients must fall back to `initialize`.
         None => {
             return jsonrpc_error(
                 StatusCode::BAD_REQUEST,
@@ -353,7 +353,8 @@ async fn reap_idle(app: Arc<App>, timeout: Duration) {
         tick.tick().await;
         let mut sessions = app.sessions.lock().unwrap();
         sessions.retain(|id, session| {
-            let alive = session.last_seen.lock().unwrap().elapsed() < timeout;
+            let alive = session.last_seen.lock().unwrap().elapsed() < timeout
+                || !session.pending.lock().unwrap().is_empty();
             if !alive {
                 eprintln!("airlock: session {id} idle; killing");
                 session.kill();

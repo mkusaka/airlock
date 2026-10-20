@@ -54,8 +54,8 @@ claude mcp add --transport http my-server https://<host>/mcp \
 ## Limitations
 
 - Only session-based Streamable HTTP (protocol versions up to `2025-11-25`) is
-  supported. Sessionless requests such as `server/discover` from `2026-07-28`
-  clients are rejected with `400`, and clients fall back to `initialize`.
+  supported. Sessionless requests such as `2026-07-28` `server/discover` are
+  rejected with `400`; clients must fall back to `initialize`.
 - A single shared token: sessions are isolated, but callers are not told apart.
 - JSON-RPC batches and SSE resumption (`Last-Event-ID`) are not supported.
 
