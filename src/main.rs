@@ -1,7 +1,10 @@
-//! Airlock: expose a stdio MCP server over authenticated Streamable HTTP.
+//! Airlock: expose a stdio MCP server over Streamable HTTP behind Cloudflare Access.
 //!
-//! Every MCP session (`Mcp-Session-Id`) gets its own child process, so callers
-//! never share server state. JSON-RPC messages are piped through unmodified.
+//! Every MCP session (`Mcp-Session-Id`) gets its own child process, owned by
+//! the Access identity that created it. JSON-RPC messages are piped through
+//! unmodified.
+
+mod access;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -10,11 +13,11 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{Request, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::extract::{Extension, Request, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -26,7 +29,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{OwnedMutexGuard, mpsc, oneshot};
 
-const TOKEN_ENV: &str = "AIRLOCK_TOKEN";
+const ACCESS_HEADER: &str = "cf-access-jwt-assertion";
+/// Environment variable telling the child which Access identity it serves.
+const USER_ENV: &str = "AIRLOCK_USER";
 const SESSION_HEADER: &str = "mcp-session-id";
 /// Server-initiated messages buffered per session while no GET stream is open.
 const OUTBOUND_BUFFER: usize = 256;
@@ -34,10 +39,15 @@ const OUTBOUND_BUFFER: usize = 256;
 #[derive(Parser)]
 #[command(
     version,
-    about = "Expose a stdio MCP server over authenticated Streamable HTTP",
-    after_help = "The bearer token is read from the AIRLOCK_TOKEN environment variable."
+    about = "Expose a stdio MCP server over Streamable HTTP behind Cloudflare Access"
 )]
 struct Args {
+    /// Cloudflare Access team domain, e.g. https://<team>.cloudflareaccess.com.
+    #[arg(long)]
+    team_domain: String,
+    /// Application Audience (AUD) tag of the Access application.
+    #[arg(long)]
+    aud: String,
     /// Address to listen on.
     #[arg(long, default_value = "127.0.0.1:8080")]
     listen: SocketAddr,
@@ -50,12 +60,17 @@ struct Args {
 }
 
 struct App {
-    token: String,
+    verifier: access::Verifier,
     command: Vec<String>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
 }
 
+/// Access identity of the caller, set by [`require_access`].
+#[derive(Clone)]
+struct User(String);
+
 struct Session {
+    owner: String,
     child: Mutex<Child>,
     stdin: tokio::sync::Mutex<ChildStdin>,
     /// Waiting POST requests keyed by their serialized JSON-RPC id.
@@ -94,12 +109,8 @@ impl Drop for PendingGuard {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let token = std::env::var(TOKEN_ENV).unwrap_or_default();
-    if token.is_empty() {
-        bail!("{TOKEN_ENV} must be set to a non-empty bearer token");
-    }
     let app = Arc::new(App {
-        token,
+        verifier: access::Verifier::new(&args.team_domain, &args.aud),
         command: args.command,
         sessions: Mutex::default(),
     });
@@ -114,7 +125,7 @@ async fn main() -> anyhow::Result<()> {
             "/mcp",
             post(handle_post).get(handle_get).delete(handle_delete),
         )
-        .layer(middleware::from_fn_with_state(app.clone(), require_token))
+        .layer(middleware::from_fn_with_state(app.clone(), require_access))
         .with_state(app.clone());
 
     let listener = tokio::net::TcpListener::bind(args.listen)
@@ -133,29 +144,31 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn require_token(State(app): State<Arc<App>>, request: Request, next: Next) -> Response {
-    let presented = request
+/// Origin-side check required by Access: reject anything without a valid JWT.
+async fn require_access(State(app): State<Arc<App>>, mut request: Request, next: Next) -> Response {
+    let token = request
         .headers()
-        .get(header::AUTHORIZATION)
+        .get(ACCESS_HEADER)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    match presented {
-        Some(token) if constant_time_eq(token.as_bytes(), app.token.as_bytes()) => {
+        .unwrap_or_default();
+    match app.verifier.verify(token).await {
+        Ok(user) => {
+            request.extensions_mut().insert(User(user));
             next.run(request).await
         }
-        _ => (
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Bearer")],
-        )
-            .into_response(),
+        Err(err) => {
+            eprintln!("airlock: rejected request: {err:#}");
+            StatusCode::FORBIDDEN.into_response()
+        }
     }
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
-async fn handle_post(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> Response {
+async fn handle_post(
+    State(app): State<Arc<App>>,
+    Extension(User(user)): Extension<User>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let Ok(message) = serde_json::from_slice::<Value>(&body) else {
         return jsonrpc_error(StatusCode::BAD_REQUEST, Value::Null, -32700, "parse error");
     };
@@ -171,12 +184,12 @@ async fn handle_post(State(app): State<Arc<App>>, headers: HeaderMap, body: Byte
     let is_request = id.is_some() && message.get("method").is_some();
 
     let (session_id, session) = match session_id(&headers) {
-        Some(sid) => match app.get_session(sid) {
+        Some(sid) => match app.get_session(sid, &user) {
             Some(session) => (sid.to_owned(), session),
             None => return StatusCode::NOT_FOUND.into_response(),
         },
         None if message.get("method").and_then(Value::as_str) == Some("initialize") => {
-            match app.spawn_session() {
+            match app.spawn_session(user) {
                 Ok(created) => created,
                 Err(err) => {
                     eprintln!("airlock: failed to spawn MCP server: {err:#}");
@@ -242,8 +255,12 @@ async fn handle_post(State(app): State<Arc<App>>, headers: HeaderMap, body: Byte
 }
 
 /// Standalone SSE stream for server-initiated requests and notifications.
-async fn handle_get(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
-    let Some(session) = session_id(&headers).and_then(|sid| app.get_session(sid)) else {
+async fn handle_get(
+    State(app): State<Arc<App>>,
+    Extension(User(user)): Extension<User>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(session) = session_id(&headers).and_then(|sid| app.get_session(sid, &user)) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let Ok(rx) = session.outbound_rx.clone().try_lock_owned() else {
@@ -259,8 +276,15 @@ async fn handle_get(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
         .into_response()
 }
 
-async fn handle_delete(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
-    let removed = session_id(&headers).and_then(|sid| app.sessions.lock().unwrap().remove(sid));
+async fn handle_delete(
+    State(app): State<Arc<App>>,
+    Extension(User(user)): Extension<User>,
+    headers: HeaderMap,
+) -> Response {
+    let removed = session_id(&headers).and_then(|sid| {
+        app.get_session(sid, &user)?;
+        app.sessions.lock().unwrap().remove(sid)
+    });
     match removed {
         Some(session) => {
             session.kill();
@@ -280,14 +304,16 @@ fn jsonrpc_error(status: StatusCode, id: Value, code: i64, message: &str) -> Res
 }
 
 impl App {
-    fn get_session(&self, id: &str) -> Option<Arc<Session>> {
-        self.sessions.lock().unwrap().get(id).cloned()
+    /// Looks up a session; other users' sessions are reported as missing.
+    fn get_session(&self, id: &str, user: &str) -> Option<Arc<Session>> {
+        let session = self.sessions.lock().unwrap().get(id).cloned()?;
+        (session.owner == user).then_some(session)
     }
 
-    fn spawn_session(self: &Arc<Self>) -> anyhow::Result<(String, Arc<Session>)> {
+    fn spawn_session(self: &Arc<Self>, user: String) -> anyhow::Result<(String, Arc<Session>)> {
         let mut child = Command::new(&self.command[0])
             .args(&self.command[1..])
-            .env_remove(TOKEN_ENV)
+            .env(USER_ENV, &user)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -298,6 +324,7 @@ impl App {
         let stdout = child.stdout.take().context("child stdout missing")?;
         let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_BUFFER);
         let session = Arc::new(Session {
+            owner: user,
             child: Mutex::new(child),
             stdin: tokio::sync::Mutex::new(stdin),
             pending: Mutex::default(),
@@ -310,7 +337,7 @@ impl App {
             .lock()
             .unwrap()
             .insert(id.clone(), session.clone());
-        eprintln!("airlock: session {id} started");
+        eprintln!("airlock: session {id} started for {}", session.owner);
 
         let app = self.clone();
         let reader_session = session.clone();

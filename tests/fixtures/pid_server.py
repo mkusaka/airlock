@@ -1,4 +1,4 @@
-"""Minimal stdio MCP server whose only tool reports its own process id."""
+"""Minimal stdio MCP server whose only tool reports its process id and user."""
 
 import json
 import os
@@ -16,9 +16,9 @@ for line in sys.stdin:
             "serverInfo": {"name": "pid-server", "version": "0.0.0"},
         }
     elif method == "tools/list":
-        result = {"tools": [{"name": "pid", "inputSchema": {"type": "object"}}]}
+        result = {"tools": [{"name": "whoami", "inputSchema": {"type": "object"}}]}
     elif method == "tools/call":
-        result = {"content": [{"type": "text", "text": str(os.getpid())}]}
+        result = {"content": [{"type": "text", "text": f"{os.getpid()} {os.environ['AIRLOCK_USER']}"}]}
     else:
         result = {}
     print(json.dumps({"jsonrpc": "2.0", "id": msg_id, "result": result}), flush=True)
