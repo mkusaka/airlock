@@ -54,10 +54,7 @@ impl Verifier {
 
     async fn key(&self, kid: &str) -> anyhow::Result<DecodingKey> {
         let mut jwks = self.jwks.lock().await;
-        let stale = jwks.as_ref().is_none_or(|(fetched, set)| {
-            set.find(kid).is_none() && fetched.elapsed() > REFRESH_INTERVAL
-        });
-        if stale {
+        if needs_fetch(jwks.as_ref(), kid) {
             let body = self
                 .http
                 .get(&self.certs_url)
@@ -71,5 +68,33 @@ impl Verifier {
         let (_, set) = jwks.as_ref().context("JWKS unavailable")?;
         let jwk = set.find(kid).context("unknown kid")?;
         Ok(DecodingKey::from_jwk(jwk)?)
+    }
+}
+
+/// Fetch on first use, and again when a key rotates in (unknown `kid`), but at
+/// most once per [`REFRESH_INTERVAL`] so bogus `kid`s cannot hammer the JWKS.
+fn needs_fetch(cached: Option<&(Instant, JwkSet)>, kid: &str) -> bool {
+    cached.is_none_or(|(fetched, set)| {
+        set.find(kid).is_none() && fetched.elapsed() > REFRESH_INTERVAL
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn needs_fetch_on_first_use_and_rate_limited_rotation() {
+        let set: JwkSet = serde_json::from_value(serde_json::json!({"keys": [
+            {"kty": "RSA", "kid": "known", "n": "AQAB", "e": "AQAB"}
+        ]}))
+        .unwrap();
+        let fresh = Instant::now();
+        let old = fresh - REFRESH_INTERVAL - Duration::from_secs(1);
+
+        assert!(needs_fetch(None, "known"));
+        assert!(!needs_fetch(Some(&(old, set.clone())), "known"));
+        assert!(!needs_fetch(Some(&(fresh, set.clone())), "rotated"));
+        assert!(needs_fetch(Some(&(old, set)), "rotated"));
     }
 }

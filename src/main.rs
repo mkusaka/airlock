@@ -362,11 +362,11 @@ impl App {
 fn route_from_server(session: &Session, message: Value) {
     let is_response = message.get("method").is_none();
     if is_response && let Some(id) = message.get("id") {
-        let waiter = session.pending.lock().unwrap().remove(&id.to_string());
-        if let Some(waiter) = waiter {
+        // Responses only go to their POST; one whose caller left is dropped.
+        if let Some(waiter) = session.pending.lock().unwrap().remove(&id.to_string()) {
             let _ = waiter.send(message);
-            return;
         }
+        return;
     }
     if session.outbound_tx.try_send(message).is_err() {
         eprintln!("airlock: dropping server message; no GET stream is draining the buffer");

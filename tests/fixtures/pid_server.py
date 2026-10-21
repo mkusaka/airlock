@@ -1,13 +1,24 @@
-"""Minimal stdio MCP server whose only tool reports its process id and user."""
+"""Minimal stdio MCP server for airlock tests.
+
+Tools:
+- whoami: reports its process id and AIRLOCK_USER.
+- ask: sends roots/list to the client and returns the client's answer.
+- exit: exits without answering.
+"""
 
 import json
 import os
 import sys
 
-for line in sys.stdin:
+
+def send(message):
+    print(json.dumps({"jsonrpc": "2.0", **message}), flush=True)
+
+
+while line := sys.stdin.readline():
     message = json.loads(line)
     method, msg_id = message.get("method"), message.get("id")
-    if msg_id is None:
+    if method is None or msg_id is None:
         continue
     if method == "initialize":
         result = {
@@ -16,9 +27,18 @@ for line in sys.stdin:
             "serverInfo": {"name": "pid-server", "version": "0.0.0"},
         }
     elif method == "tools/list":
-        result = {"tools": [{"name": "whoami", "inputSchema": {"type": "object"}}]}
+        names = ["whoami", "ask", "exit"]
+        result = {"tools": [{"name": n, "inputSchema": {"type": "object"}} for n in names]}
     elif method == "tools/call":
-        result = {"content": [{"type": "text", "text": f"{os.getpid()} {os.environ['AIRLOCK_USER']}"}]}
+        tool = message["params"]["name"]
+        if tool == "exit":
+            sys.exit(0)
+        if tool == "ask":
+            send({"id": "srv-1", "method": "roots/list"})
+            text = json.dumps(json.loads(sys.stdin.readline())["result"])
+        else:
+            text = f"{os.getpid()} {os.environ['AIRLOCK_USER']}"
+        result = {"content": [{"type": "text", "text": text}]}
     else:
         result = {}
-    print(json.dumps({"jsonrpc": "2.0", "id": msg_id, "result": result}), flush=True)
+    send({"id": msg_id, "result": result})
